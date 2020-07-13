@@ -351,9 +351,11 @@ interface PledgeFragmentViewModel {
         private val decreaseBonusButtonIsEnabled = BehaviorSubject.create<Boolean>()
         private val increaseBonusButtonIsEnabled = BehaviorSubject.create<Boolean>()
         private val bonusHint = BehaviorSubject.create<String>()
+        
+        // - Keep track if the bonus stepper increase/decrease has being pressed at some point
+        private val bonusAmountHasChanged = BehaviorSubject.create<Boolean>(false)
         private val isNoReward = BehaviorSubject.create<Boolean>()
         private val projectTitle = BehaviorSubject.create<String>()
-
 
         private val apiClient = environment.apiClient()
         private val apolloClient = environment.apolloClient()
@@ -451,7 +453,7 @@ interface PledgeFragmentViewModel {
             reward
                     .filter { !RewardUtils.isNoReward(it) }
                     .compose<Pair<Reward, String>>(combineLatestPair(this.pledgeMinimum))
-                    .map { Pair(it.first.title()?: "", it.second) }
+                    .map { Pair(it.first.title() ?: "", it.second) }
                     .compose(bindToLifecycle())
                     .subscribe(this.titleAndAmount)
 
@@ -585,6 +587,19 @@ interface PledgeFragmentViewModel {
                     .compose(bindToLifecycle())
                     .subscribe(this.bonusAmount)
 
+            backing.compose<Pair<Backing, PledgeReason>>(combineLatestPair(pledgeReason))
+                    .filter { it.second == PledgeReason.UPDATE_PLEDGE }
+                    .switchMap { getBacking(it.first.id().toString()) }
+                    .compose(bindToLifecycle())
+                    .subscribe {
+                        this.bonusAmount.onNext(it.bonusAmount().toInt().toString())
+                    }
+
+            Observable.merge(this.decreaseBonusButtonClicked, this.decreasePledgeButtonClicked, this.increaseBonusButtonClicked, this.increasePledgeButtonClicked)
+                    .distinctUntilChanged()
+                    .subscribe {
+                        this.bonusAmountHasChanged.onNext(true)
+                    }
 
             // Shipping rules section
             val shippingRules = projectAndReward
@@ -637,24 +652,22 @@ interface PledgeFragmentViewModel {
                     .compose(bindToLifecycle())
                     .subscribe(this.shippingAmount)
 
-
-            val shippingAmountPlusBonus = shippingAmount.compose<Pair<Double, Double>>(combineLatestPair(bonusInput))
-                    .compose(bindToLifecycle())
-                    .map { it.first + it.second }
-
-
-            // Total pledge section
-            val total = pledgeInput
-                    .compose<Pair<Double, Double>>(combineLatestPair(shippingAmountPlusBonus))
-                    .map { it.first + it.second }
+            val total = Observable.combineLatest(reward, shippingAmount, this.bonusAmount, rewardMinimum, pledgeInput, pledgeReason){ rw, sAmount, bAmount, rMinimumAmount, pInput, pReason ->
+                        return@combineLatest getAmount(sAmount, bAmount, rMinimumAmount, rw, pInput, pReason)
+                    }
                     .distinctUntilChanged()
 
+            total
+                    .compose<Pair<Double,String>>(combineLatestPair(this.bonusAmount))
+                    .map { it.first.toString() + it.second.toInt().toString()}
+                    .compose(bindToLifecycle())
 
             total
                     .compose<Pair<Double, Project>>(combineLatestPair(project))
                     .map { ProjectViewUtils.styleCurrency(it.first, it.second, this.ksCurrency) }
                     .compose(bindToLifecycle())
                     .subscribe(this.totalAmount)
+
 
             total
                     .compose<Pair<Double, Project>>(combineLatestPair(project))
@@ -788,7 +801,21 @@ interface PledgeFragmentViewModel {
                     .map { it.first != it.second }
                     .startWith(false)
 
-            val amountUpdated = pledgeInput
+            val rewardAmountUpdated = total
+                    .compose<Pair<Double, Reward>>(combineLatestPair(reward))
+                    .filter { !RewardUtils.isNoReward(it.second)}
+                    .map { it.first }
+                    .compose<Pair<Double, Boolean>>(combineLatestPair(updatingPledge))
+                    .filter { it.second }
+                    .map { it.first }
+                    .compose<Pair<Double, Backing>>(combineLatestPair(backing))
+                    .map { it.first != it.second.amount() }
+                    .startWith(false)
+
+            val noRewardAmountUpdated = pledgeInput
+                    .compose<Pair<Double, Reward>>(combineLatestPair(reward))
+                    .filter { RewardUtils.isNoReward(it.second)}
+                    .map { it.first }
                     .compose<Pair<Double, Boolean>>(combineLatestPair(updatingPledge))
                     .filter { it.second }
                     .map { it.first }
@@ -796,9 +823,16 @@ interface PledgeFragmentViewModel {
                     .map { it.first != it.second }
                     .startWith(false)
 
-            val shippingOrAmountChanged = shippingRuleUpdated
-                    .compose<Pair<Boolean, Boolean>>(combineLatestPair(amountUpdated))
-                    .map { it.first || it.second }
+            val amountUpdated = Observable.combineLatest(reward, rewardAmountUpdated, noRewardAmountUpdated){ rw, rAmount, noRAmount ->
+                if (RewardUtils.isNoReward(rw)) return@combineLatest noRAmount
+                else return@combineLatest rAmount
+            }
+                    .distinctUntilChanged()
+
+            val shippingOrAmountChanged = Observable.combineLatest(shippingRuleUpdated, this.bonusAmountHasChanged, amountUpdated){ shippingUpdated, bHasChanged, aUpdated ->
+                return@combineLatest if (shippingUpdated) true
+                else bHasChanged && aUpdated
+            }
                     .distinctUntilChanged()
 
             val minAndMaxTotal = minimumPledge
@@ -821,7 +855,7 @@ interface PledgeFragmentViewModel {
             Observable.merge(updatingReward, changeDuringUpdatingPledge)
                     .distinctUntilChanged()
                     .compose(bindToLifecycle())
-                    .subscribe(this.pledgeButtonIsEnabled)
+                    .subscribe { this.pledgeButtonIsEnabled.onNext(it) }
 
             // Payment section
             pledgeReason
@@ -903,7 +937,7 @@ interface PledgeFragmentViewModel {
                     .map { it.second }
                     .distinctUntilChanged()
                     .compose(bindToLifecycle())
-                    .subscribe(this.pledgeButtonIsEnabled)
+                    .subscribe { this.pledgeButtonIsEnabled.onNext(it) }
 
             val pledgeButtonClicked = userIsLoggedIn
                     .compose<Pair<Boolean, PledgeReason>>(combineLatestPair(pledgeReason))
@@ -1002,8 +1036,8 @@ interface PledgeFragmentViewModel {
                     this.stripeSetupResultSuccessful.filter { it == StripeIntentResult.Outcome.SUCCEEDED })
                     .compose<Pair<Any, PledgeReason>>(combineLatestPair(pledgeReason))
 
-            Observable.combineLatest<Double, Double, Checkout, CheckoutData>(shippingAmount, total, Observable.merge(successfulCheckout, successfulSCACheckout))
-            { s, t, c -> checkoutData(s, t, c) }
+            Observable.combineLatest<Double, Double, String, Checkout, CheckoutData>(shippingAmount, total, this.bonusAmount, Observable.merge(successfulCheckout, successfulSCACheckout))
+            { s, t, b, c -> checkoutData(s, t, b.toDouble(), c) }
                     .compose<Pair<CheckoutData, PledgeData>>(combineLatestPair(pledgeData))
                     .filter { it.second.pledgeFlowContext() == PledgeFlowContext.NEW_PLEDGE }
                     .compose(bindToLifecycle())
@@ -1123,8 +1157,8 @@ interface PledgeFragmentViewModel {
                     .compose(bindToLifecycle())
                     .subscribe { this.lake.trackCheckoutPaymentPageViewed(it) }
 
-            Observable.combineLatest<Double, Double, CheckoutData>(shippingAmount, total)
-            { s, t -> checkoutData(s, t, null) }
+            Observable.combineLatest<Double, Double, String, CheckoutData>(shippingAmount, total, this.bonusAmount)
+            { s, t, b -> checkoutData(s, t, b.toDouble(), null) }
                     .compose<Pair<CheckoutData, PledgeData>>(combineLatestPair(pledgeData))
                     .filter { shouldTrackPledgeSubmitButtonClicked(it.second.pledgeFlowContext()) }
                     .compose<Pair<CheckoutData, PledgeData>>(takeWhen(this.pledgeButtonClicked))
@@ -1140,15 +1174,35 @@ interface PledgeFragmentViewModel {
                     }
         }
 
+        private fun getAmount(sAmount: Double, bAmount: String, rMinimumAmount: Double, reward: Reward, pInput: Double, pledgeReason: PledgeReason): Double {
+            var totalPledgeValue = pInput
+            if (!RewardUtils.isNoReward(reward))
+                totalPledgeValue = (sAmount + bAmount.toInt() + rMinimumAmount)
+
+            if (RewardUtils.isNoReward(reward) && pledgeReason == PledgeReason.PLEDGE)
+                totalPledgeValue = pInput + bAmount.toInt()
+
+            if (RewardUtils.isNoReward(reward) && pledgeReason == PledgeReason.UPDATE_PLEDGE) {
+                totalPledgeValue = pInput
+            }
+
+            return totalPledgeValue
+        }
+
+        private fun getBacking(backingId: String): Observable<Backing> {
+            return this.apolloClient.getBacking(backingId)
+        }
+
         private fun backingShippingRule(shippingRules: List<ShippingRule>, backing: Backing): Observable<ShippingRule> {
             return Observable.just(shippingRules.firstOrNull { it.location().id() == backing.locationId() })
         }
 
-        private fun checkoutData(shippingAmount: Double, total: Double, checkout: Checkout?): CheckoutData {
+        private fun checkoutData(shippingAmount: Double, total: Double, bonusAmount: Double?, checkout: Checkout?): CheckoutData {
             return CheckoutData.builder()
                     .amount(total)
                     .id(checkout?.id())
                     .paymentType(CreditCardPaymentType.CREDIT_CARD)
+                    .bonusAmount(bonusAmount)
                     .shippingAmount(shippingAmount)
                     .build()
         }
